@@ -26,6 +26,15 @@ MODEL_DIR="${MODEL_DIR:-$SCRIPT_DIR/vision_model}"          # folder holding the
 MODEL_FILE="${MODEL_FILE:-Bonsai-27b-1bit-CRACK-Q1_0.gguf}"          # language model
 MMPROJ_FILE="${MMPROJ_FILE:-mmproj-Bonsai-27b-1bit-CRACK-F16.gguf}"  # vision projector
 
+# --- Auto-download (Hugging Face) ------------------------------------------ #
+# If a selected model / projector is missing locally it can be fetched from HF.
+HF_REPO="${HF_REPO:-}"               # repo for the language model (auto-resolved if blank)
+HF_MMPROJ_REPO="${HF_MMPROJ_REPO:-}" # repo for the projector (defaults to HF_REPO)
+HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"   # mirror endpoint if needed
+AUTO_DOWNLOAD="${AUTO_DOWNLOAD:-ask}"  # ask | 1 (always) | 0 (never, error if missing)
+MODEL_ID="${MODEL_ID:-}"             # preset id: 'crack' or 'onebit' (see --model-id)
+MODEL_SET=0                          # 1 once a model is chosen explicitly (skips the menu)
+
 # --- Network --------------------------------------------------------------- #
 OPEN_TO_LAN="${OPEN_TO_LAN:-1}"      # 1 = bind 0.0.0.0 (whole LAN), 0 = 127.0.0.1 only
 HOST="${HOST:-}"                     # explicit bind address (overrides OPEN_TO_LAN if set)
@@ -78,6 +87,108 @@ ok()   { printf '%s\n' "${G}  ✓${N} $*"; }
 warn() { printf '%s\n' "${Y}  ! ${N}$*" >&2; }
 die()  { printf '%s\n' "${R}  ✗ ERROR:${N} $*" >&2; exit 1; }
 
+# --------------------------------------------------------------------------- #
+# Model catalog + Hugging Face auto-download
+# --------------------------------------------------------------------------- #
+# Map a known .gguf filename to the Hugging Face repo that publishes it, so a
+# missing model/projector can be fetched automatically.
+repo_for_file() {
+  case "$1" in
+    # CRACK 1-bit build (the local default) — dealign.ai
+    Bonsai-27b-1bit-CRACK-Q1_0.gguf|mmproj-Bonsai-27b-1bit-CRACK-F16.gguf)
+      echo "dealignai/Bonsai-27b-1bit-CRACK-GGUF" ;;
+    # CRACK ternary (Q2_0) build — dealign.ai
+    Bonsai-27b-Ternary-CRACK-Q2_0.gguf|mmproj-Bonsai-27b-Ternary-CRACK-F16.gguf)
+      echo "dealignai/Bonsai-27b-Ternary-CRACK-GGUF" ;;
+    # Prism ML 1-bit build (+ dspark drafter and mmproj packs)
+    Bonsai-27B-Q1_0.gguf|Bonsai-27B-F16.gguf|Bonsai-27B-dspark-*.gguf|Bonsai-27B-mmproj-*.gguf)
+      echo "prism-ml/Bonsai-27B-gguf" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Apply a named preset. Both CRACK and Prism builds auto-download when selected.
+apply_model_id() {
+  case "$1" in
+    crack|crack-1bit|bonsai-crack)          # dealignai 1-bit CRACK (default)
+      MODEL_FILE="Bonsai-27b-1bit-CRACK-Q1_0.gguf"
+      MMPROJ_FILE="mmproj-Bonsai-27b-1bit-CRACK-F16.gguf"
+      HF_REPO="dealignai/Bonsai-27b-1bit-CRACK-GGUF"
+      HF_MMPROJ_REPO="dealignai/Bonsai-27b-1bit-CRACK-GGUF" ;;
+    ternary|crack-ternary|q2)               # dealignai ternary (Q2_0) CRACK
+      MODEL_FILE="Bonsai-27b-Ternary-CRACK-Q2_0.gguf"
+      MMPROJ_FILE="mmproj-Bonsai-27b-Ternary-CRACK-F16.gguf"
+      HF_REPO="dealignai/Bonsai-27b-Ternary-CRACK-GGUF"
+      HF_MMPROJ_REPO="dealignai/Bonsai-27b-Ternary-CRACK-GGUF" ;;
+    onebit|1bit|q1|bonsai-1bit)             # prism-ml 1-bit
+      MODEL_FILE="Bonsai-27B-Q1_0.gguf"
+      MMPROJ_FILE="Bonsai-27B-mmproj-Q8_0.gguf"
+      HF_REPO="prism-ml/Bonsai-27B-gguf"
+      HF_MMPROJ_REPO="prism-ml/Bonsai-27B-gguf" ;;
+    *) die "Unknown --model-id '$1' (known: crack, ternary, onebit)" ;;
+  esac
+  MODEL_SET=1
+}
+
+# Download one file from Hugging Face into a destination path.
+fetch_hf() {  # <repo> <filename> <dest_path>
+  local repo="$1" file="$2" dest="$3" dir tmp url
+  dir="$(dirname "$dest")"; tmp="${dest}.part"
+  mkdir -p "$dir"
+  url="${HF_ENDPOINT%/}/${repo}/resolve/main/${file}?download=true"
+  log "Downloading ${file}"
+  printf '    from : %s/%s\n' "${HF_ENDPOINT%/}/${repo}" "$file"
+  printf '    to   : %s\n' "$dest"
+  if command -v hf >/dev/null 2>&1; then
+    hf download "$repo" "$file" --local-dir "$dir" && [ -s "$dest" ] && return 0
+  elif command -v huggingface-cli >/dev/null 2>&1; then
+    huggingface-cli download "$repo" "$file" --local-dir "$dir" \
+      --local-dir-use-symlinks False && [ -s "$dest" ] && return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    local auth=(); [ -n "${HF_TOKEN:-}" ] && auth=( -H "Authorization: Bearer ${HF_TOKEN}" )
+    # Try a resumable download first, then a clean retry if ranges are refused.
+    if curl -fL --retry 4 --retry-delay 2 -C - "${auth[@]}" -o "$tmp" "$url" \
+       || { rm -f "$tmp"; curl -fL --retry 4 --retry-delay 2 "${auth[@]}" -o "$tmp" "$url"; }; then
+      mv -f "$tmp" "$dest"; [ -s "$dest" ] && return 0
+    fi
+    rm -f "$tmp"
+  elif command -v wget >/dev/null 2>&1; then
+    local wauth=(); [ -n "${HF_TOKEN:-}" ] && wauth=( --header "Authorization: Bearer ${HF_TOKEN}" )
+    if wget -c "${wauth[@]}" -O "$tmp" "$url"; then
+      mv -f "$tmp" "$dest"; [ -s "$dest" ] && return 0
+    fi
+    rm -f "$tmp"
+  else
+    die "No downloader found — install curl, wget, or the Hugging Face CLI."
+  fi
+  return 1
+}
+
+# Ensure a file exists locally, downloading it if we know where it lives.
+ensure_file() {  # <local_path> <filename> <repo-hint> <label>
+  local dest="$1" file="$2" repo="$3" label="$4"
+  if [ -f "$dest" ] && [ -s "$dest" ]; then ok "$label present: $dest"; return 0; fi
+  [ -z "$repo" ] && repo="$(repo_for_file "$file")"
+  if [ -z "$repo" ]; then
+    die "$label not found: $dest
+    Unknown Hugging Face repo for '$file' — place it manually, pass --hf-repo <owner/name>,
+    or choose the downloadable model with --model-id onebit."
+  fi
+  case "$AUTO_DOWNLOAD" in
+    0) die "$label not found: $dest  (auto-download disabled with --no-download)";;
+    1) : ;;
+    *) if [ -t 0 ]; then
+         local a=""; read -rp "Download $label '$file' (~from $repo) now? [Y/n]: " a || true
+         case "$a" in [Nn]*) die "Declined — place $dest manually and re-run." ;; esac
+       else
+         die "$label not found: $dest  (run interactively or pass --download to fetch it)"
+       fi ;;
+  esac
+  fetch_hf "$repo" "$file" "$dest" || die "Download failed: $file from $repo"
+  ok "$label ready: $dest"
+}
+
 usage() {
   cat <<EOF
 ${B}start_server_cpu.sh${N} — launch the Prism llama.cpp Bonsai server on the LAN.
@@ -88,6 +199,17 @@ Model:
   --model-dir <path>   Folder with the .gguf files   (default: $MODEL_DIR)
   --model <file>       Language model filename        (default: $MODEL_FILE)
   --mmproj <file>      Vision projector filename       (default: $MMPROJ_FILE)
+  --model-id <id>      Preset (all auto-download): 'crack' (dealignai 1-bit CRACK,
+                                default), 'ternary' (dealignai Q2_0 CRACK),
+                                or 'onebit' (prism-ml/Bonsai-27B-gguf)
+
+Download (Hugging Face):
+  --download           Fetch a missing model/projector without asking
+  --no-download        Never download; error if a file is missing
+  --hf-repo <o/n>      Repo to fetch the model from    (default: auto by filename)
+  --hf-mmproj-repo <o/n>  Repo to fetch the projector from (default: --hf-repo)
+  --hf-endpoint <url>  HF mirror endpoint              (default: $HF_ENDPOINT)
+  (set HF_TOKEN in the environment for gated/private repos)
 
 Network:
   --host <addr>        Bind address (e.g. 0.0.0.0 or 127.0.0.1)
@@ -116,7 +238,7 @@ Image / vision:
 Other:
   --server-bin <path>  Path to llama-server (auto-detected otherwise)
   --extra "<args>"     Extra args appended to llama-server verbatim
-  -y, --yes            Non-interactive: skip the menu (uses current image setting)
+  -y, --yes            Non-interactive: skip the menus and auto-download if needed
   -h, --help           Show this help
 EOF
 }
@@ -124,11 +246,20 @@ EOF
 # --------------------------------------------------------------------------- #
 # Argument parsing
 # --------------------------------------------------------------------------- #
+# Apply a preset chosen via the MODEL_ID env var first, so explicit flags win.
+[ -n "$MODEL_ID" ] && apply_model_id "$MODEL_ID"
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --model-dir)     MODEL_DIR="$2"; shift ;;
-    --model)         MODEL_FILE="$2"; shift ;;
+    --model)         MODEL_FILE="$2"; MODEL_SET=1; shift ;;
     --mmproj)        MMPROJ_FILE="$2"; shift ;;
+    --model-id)      apply_model_id "$2"; shift ;;
+    --download)      AUTO_DOWNLOAD=1 ;;
+    --no-download)   AUTO_DOWNLOAD=0 ;;
+    --hf-repo)       HF_REPO="$2"; shift ;;
+    --hf-mmproj-repo) HF_MMPROJ_REPO="$2"; shift ;;
+    --hf-endpoint)   HF_ENDPOINT="$2"; shift ;;
     --host)          HOST="$2"; shift ;;
     --lan)           OPEN_TO_LAN=1; HOST="" ;;
     --local)         OPEN_TO_LAN=0; HOST="" ;;
@@ -170,6 +301,31 @@ fi
 [ -n "$SERVER_BIN" ] && [ -x "$SERVER_BIN" ] || \
   die "llama-server not found. Build it first with ./build_pc.sh (or pass --server-bin)."
 
+# -y implies "download automatically if a selected model is missing".
+[ "$ASSUME_YES" -eq 1 ] && [ "$AUTO_DOWNLOAD" = "ask" ] && AUTO_DOWNLOAD=1
+
+# --------------------------------------------------------------------------- #
+# Interactive model-selection menu
+# --------------------------------------------------------------------------- #
+choose_model() {
+  # Skip when a model was chosen explicitly, when non-interactive, or with -y.
+  if [ "$MODEL_SET" = "1" ] || [ "$ASSUME_YES" -eq 1 ] || [ ! -t 0 ]; then return; fi
+  echo
+  printf '%s\n' "${B}Bonsai 27B — select model${N}"
+  printf '  %s1)%s Bonsai 27B CRACK · Q1_0   — dealignai/Bonsai-27b-1bit-CRACK-GGUF   (default)\n' "$C" "$N"
+  printf '  %s2)%s Bonsai 27B · Q1_0 (1-bit) — prism-ml/Bonsai-27B-gguf\n' "$C" "$N"
+  printf '     %sboth auto-download (~3.9 GB) if the .gguf is not already in vision_model/%s\n' "$Y" "$N"
+  echo
+  local choice=""
+  read -rp "Enter choice [1-2] (default 1): " choice || true
+  case "$choice" in
+    1) apply_model_id crack;  ok "Selected Bonsai 27B CRACK Q1_0 (dealignai/Bonsai-27b-1bit-CRACK-GGUF)" ;;
+    2) apply_model_id onebit; ok "Selected Bonsai 27B Q1_0 (prism-ml/Bonsai-27B-gguf)" ;;
+    *) : ;;   # empty / other: keep current defaults (respects a custom MODEL_FILE)
+  esac
+}
+choose_model
+
 # --------------------------------------------------------------------------- #
 # Interactive image-support menu
 # --------------------------------------------------------------------------- #
@@ -204,12 +360,11 @@ fi
 MODEL_PATH="$MODEL_DIR/$MODEL_FILE"
 MMPROJ_PATH="$MODEL_DIR/$MMPROJ_FILE"
 
-[ -f "$MODEL_PATH" ] || die "Model not found: $MODEL_PATH
-    Place '$MODEL_FILE' in '$MODEL_DIR' (or pass --model-dir / --model)."
-
+# Make sure the model (and, for vision, the projector) are present — downloading
+# them from Hugging Face if they are missing and a repo is known.
+ensure_file "$MODEL_PATH"  "$MODEL_FILE"  "$HF_REPO"                     "Model"
 if [ "$IMAGE_SUPPORT" = "1" ]; then
-  [ -f "$MMPROJ_PATH" ] || die "Vision projector not found: $MMPROJ_PATH
-    Place '$MMPROJ_FILE' in '$MODEL_DIR', or start without vision (--no-image)."
+  ensure_file "$MMPROJ_PATH" "$MMPROJ_FILE" "${HF_MMPROJ_REPO:-$HF_REPO}" "Vision projector"
 fi
 
 # Best-effort LAN IP for the banner (never let this abort the script)
@@ -271,6 +426,8 @@ echo
 log "Starting Prism llama.cpp server (CPU)"
 printf '    Mode        : %s\n' "$MODE_LABEL"
 printf '    Model       : %s\n' "$MODEL_PATH"
+[ -n "${HF_REPO:-$(repo_for_file "$MODEL_FILE")}" ] && \
+  printf '    Source      : %s\n' "${HF_REPO:-$(repo_for_file "$MODEL_FILE")} (Hugging Face)"
 [ "$IMAGE_SUPPORT" = "1" ] && printf '    Projector   : %s\n' "$MMPROJ_PATH"
 printf '    Bind        : %s:%s  (%s)\n' "$HOST" "$PORT" \
   "$([ "$HOST" = "0.0.0.0" ] && echo 'open to LAN' || echo 'local only')"
