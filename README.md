@@ -43,10 +43,21 @@ sudo apt-get install -y build-essential cmake git pkg-config libcurl4-openssl-de
 `libcurl4-openssl-dev` is optional (it lets `llama-server` download models by
 URL). If you skip it, build with `--no-curl`.
 
-### The model files
+### The model files (auto-downloaded on demand)
 
-The scripts expect the GGUF files in the **`vision_model/`** folder next to the
-scripts. Download the language model and (for images) the projector into it:
+The GGUF files live in the **`vision_model/`** folder next to the scripts. You
+do **not** have to download them by hand — when you pick a model at startup, the
+start scripts fetch it from Hugging Face automatically if it is missing. Both
+supported model versions download this way:
+
+| Version | Preset (`--model-id`) | Language model | Vision projector | Hugging Face repo |
+|---|---|---|---|---|
+| **CRACK · 1-bit** (default) | `crack` | `Bonsai-27b-1bit-CRACK-Q1_0.gguf` | `mmproj-Bonsai-27b-1bit-CRACK-F16.gguf` | `dealignai/Bonsai-27b-1bit-CRACK-GGUF` |
+| **Prism · 1-bit** | `onebit` | `Bonsai-27B-Q1_0.gguf` | `Bonsai-27B-mmproj-Q8_0.gguf` | `prism-ml/Bonsai-27B-gguf` |
+| CRACK · ternary Q2_0 | `ternary` | `Bonsai-27b-Ternary-CRACK-Q2_0.gguf` | `mmproj-Bonsai-27b-Ternary-CRACK-F16.gguf` | `dealignai/Bonsai-27b-Ternary-CRACK-GGUF` |
+
+Manual placement still works too — drop the `.gguf` files in `vision_model/` and
+they'll be used as-is:
 
 ```
 vision_model/
@@ -54,8 +65,9 @@ vision_model/
 └── mmproj-Bonsai-27b-1bit-CRACK-F16.gguf     # vision projector (default, optional)
 ```
 
-Both filenames are just defaults — override them with `--model` / `--mmproj`
-(see below) if your files are named differently (e.g. the `Q2_0` ternary build).
+Override the filenames with `--model` / `--mmproj`, or point at any repo with
+`--hf-repo owner/name`. Set `HF_TOKEN` in the environment for gated/private
+repos, and `HF_ENDPOINT` to use a mirror.
 
 ---
 
@@ -84,6 +96,17 @@ Handy build flags (either script): `--dir <path>`, `--repo <url>`,
 `--branch <name>`, `--jobs <N>`, `--update` (git pull first),
 `--clean` (fresh build), `--no-curl`. Run with `--help` for the full list.
 
+**Raspberry Pi ARM notes:** `build_pi.sh` detects the board and 64‑bit ARM,
+prints the ARM CPU features the compiler will enable (dotprod / i8mm / fp16),
+and builds native NEON kernels by default. If your compiler rejects
+`-mcpu=native` (older toolchains, cross/container builds), target the CPU
+explicitly:
+
+```bash
+./build_pi.sh --arm-arch armv8.2-a+dotprod+fp16   # Raspberry Pi 5 (Cortex-A76)
+./build_pi.sh --arm-arch armv8-a+crc+simd         # Raspberry Pi 4 (Cortex-A72)
+```
+
 > **Pi tip:** compiling llama.cpp is memory‑hungry. `build_pi.sh` picks a safe
 > job count from your RAM and prints swap‑file instructions if you have little
 > swap. If a build is *Killed*, re‑run with `./build_pi.sh --jobs 1`.
@@ -105,9 +128,16 @@ Handy build flags (either script): `--dir <path>`, `--repo <url>`,
 ./start_server_pi.sh --low-mem     # ctx 2048 + quantised KV cache, for tight RAM
 ```
 
-On startup you get a **menu**:
+On startup you get two quick **menus** — first the model, then the mode:
 
 ```
+Bonsai 27B — select model
+  1) Bonsai 27B CRACK · Q1_0   — dealignai/Bonsai-27b-1bit-CRACK-GGUF   (default)
+  2) Bonsai 27B · Q1_0 (1-bit) — prism-ml/Bonsai-27B-gguf
+     both auto-download (~3.9 GB) if the .gguf is not already in vision_model/
+
+Enter choice [1-2] (default 1):
+
 Bonsai 27B — select server mode
   1) Text only            — chat / completions, streaming
   2) Text + Image/Vision  — also loads the mmproj projector
@@ -115,8 +145,20 @@ Bonsai 27B — select server mode
 Enter choice [1-2] (default 1):
 ```
 
-Choosing **2** loads `mmproj-Bonsai-27b-1bit-CRACK-F16.gguf` so the model can
-see images. To skip the menu, pass `--image` / `--no-image` (or `-y`).
+Pick a model and, if its `.gguf` isn't already in `vision_model/`, it is
+**downloaded automatically** from Hugging Face (both versions are supported).
+Choosing mode **2** also fetches/loads the matching projector so the model can
+see images.
+
+Skip the menus non‑interactively:
+
+```bash
+./start_server_cpu.sh --model-id onebit --image -y      # Prism 1-bit, vision, auto-download
+./start_server_pi.sh  --model-id crack  --no-image -y   # CRACK 1-bit, text only, auto-download
+```
+
+`-y` (or `--download`) downloads a missing model without asking; `--no-download`
+makes a missing file a hard error instead.
 
 The banner then prints the exact configuration and the URLs to use, e.g.:
 
@@ -160,6 +202,10 @@ PORT=9000 ./start_server_cpu.sh
 | Model folder | `--model-dir` | `MODEL_DIR` | `./vision_model` |
 | Model file | `--model` | `MODEL_FILE` | `Bonsai-27b-1bit-CRACK-Q1_0.gguf` |
 | Vision projector | `--mmproj` | `MMPROJ_FILE` | `mmproj-Bonsai-27b-1bit-CRACK-F16.gguf` |
+| Model preset | `--model-id` | `MODEL_ID` | menu (`crack` / `ternary` / `onebit`) |
+| Auto-download | `--download` / `--no-download` | `AUTO_DOWNLOAD` | `ask` |
+| Download repo | `--hf-repo` / `--hf-mmproj-repo` | `HF_REPO` | auto by filename |
+| HF endpoint / token | `--hf-endpoint` | `HF_ENDPOINT` / `HF_TOKEN` | `https://huggingface.co` |
 | Open to LAN | `--lan` / `--local` | `OPEN_TO_LAN` | `1` (LAN, binds `0.0.0.0`) |
 | Bind address | `--host` | `HOST` | derived from `OPEN_TO_LAN` |
 | Port | `--port` | `PORT` | `8080` |
@@ -242,8 +288,10 @@ curl http://192.168.1.50:8080/props      # loaded model + chat template info
 | Symptom | Fix |
 |---|---|
 | `llama-server not found` | Run `./build_pc.sh` (or `./build_pi.sh`) first, or pass `--server-bin <path>`. |
-| `Model not found: .../vision_model/...` | Put the `.gguf` in `vision_model/`, or point at it with `--model-dir` / `--model`. |
+| `Model not found` and it won't download | You passed `--no-download`, or the filename isn't a known model — pass `--hf-repo owner/name`, or place the `.gguf` in `vision_model/` yourself. |
+| Download is slow / interrupted | Downloads resume — just re-run. Set `HF_ENDPOINT` to a mirror, or `HF_TOKEN` for gated repos. |
 | Build *Killed* on the Pi | Add swap and retry: `./build_pi.sh --jobs 1` (see the swap hint the script prints). |
+| Compiler rejects `-mcpu=native` on Pi | Target the CPU: `./build_pi.sh --arm-arch armv8.2-a+dotprod+fp16` (Pi 5) / `armv8-a+crc+simd` (Pi 4). |
 | Server errors on `--reasoning off` | `./start_server_*.sh --reasoning ""` to drop the flag. |
 | Out of memory loading model on Pi | `./start_server_pi.sh --low-mem` (smaller context + quantised KV cache). |
 | Can't reach it from another device | Make sure you're in LAN mode (default), and open the port in the firewall: `sudo ufw allow 8080/tcp`. |

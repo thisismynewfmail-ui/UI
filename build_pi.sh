@@ -26,6 +26,9 @@
 #   --update           git pull an existing clone before building.
 #   --clean            Remove the build/ directory and reconfigure from scratch.
 #   --no-curl          Build without libcurl (disables model download-by-URL).
+#   --no-native        Don't use -mcpu=native (portable/cross builds).
+#   --arm-arch <spec>  Explicit ARM target, e.g. armv8.2-a+dotprod+fp16 (Pi 5)
+#                      or armv8-a+crc+simd (Pi 4). Implies --no-native.
 #   -h, --help         Show this help and exit.
 # =============================================================================
 set -euo pipefail
@@ -40,6 +43,8 @@ LLAMA_DIR="${LLAMA_DIR:-$SCRIPT_DIR/llama.cpp}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-}"          # empty => auto (RAM-based)
 USE_CURL="auto"           # auto | on | off
+USE_NATIVE=1              # 1 = -DGGML_NATIVE=ON (-mcpu=native, best on the Pi)
+ARM_ARCH="${ARM_ARCH:-}" # explicit -DGGML_CPU_ARM_ARCH value when native is off
 INSTALL_DEPS=0
 DO_UPDATE=0
 DO_CLEAN=0
@@ -72,7 +77,9 @@ while [ $# -gt 0 ]; do
     --update)       DO_UPDATE=1 ;;
     --clean)        DO_CLEAN=1 ;;
     --no-curl)      USE_CURL="off" ;;
-    -h|--help)      sed -n '2,44p' "$0"; exit 0 ;;
+    --no-native)    USE_NATIVE=0 ;;
+    --arm-arch)     ARM_ARCH="$2"; USE_NATIVE=0; shift ;;
+    -h|--help)      sed -n '2,46p' "$0"; exit 0 ;;
     *)              die "Unknown option: $1 (try --help)";;
   esac
   shift
@@ -102,7 +109,18 @@ printf '    RAM      : %s GB\n' "$MEM_GB"
 printf '    CPU cores: %s (using -j%s to stay within RAM)\n' "$CORES" "$JOBS"
 printf '    Target   : %s\n' "$LLAMA_DIR"
 case "$ARCH" in
-  aarch64|arm64) ok "64-bit ARM detected — native NEON/dotprod kernels will be used." ;;
+  aarch64|arm64)
+    ok "64-bit ARM detected — native NEON / dotprod / i8mm kernels will be used."
+    # Identify the Pi/board model so the user knows what they're building for.
+    PI_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+    [ -n "$PI_MODEL" ] && printf '    Board    : %s\n' "$PI_MODEL"
+    # Report the ARM features the compiler will actually enable.
+    if command -v gcc >/dev/null 2>&1; then
+      FEATS="$(gcc -mcpu=native -dM -E - </dev/null 2>/dev/null \
+        | awk '/__ARM_FEATURE_(DOTPROD|MATMUL_INT8|FP16)/{print $2}' | tr '\n' ' ' || true)"
+      [ -n "$FEATS" ] && printf '    ARM feat : %s\n' "$FEATS"
+    fi
+    ;;
   x86_64|amd64)  ok "64-bit x86 detected." ;;
   armv7l|armv6l) die "32-bit ARM ('$ARCH') is not supported. A 64-bit OS is required for this model." ;;
   *)             warn "Unrecognised arch '$ARCH' — attempting a generic native build." ;;
@@ -200,18 +218,35 @@ if [ "$DO_CLEAN" -eq 1 ] && [ -d "$BUILD_DIR" ]; then
   rm -rf "$BUILD_DIR"
 fi
 
-log "Configuring (CMake, CPU backend, native ARM/x86 kernels)"
+# Choose the CPU-tuning flags. Native (-mcpu=native) is best on real hardware;
+# --no-native / --arm-arch produce a portable or cross-target binary instead.
+CMAKE_ARCH_FLAGS=( -DGGML_NATIVE=ON )
+if [ "$USE_NATIVE" -eq 0 ]; then
+  CMAKE_ARCH_FLAGS=( -DGGML_NATIVE=OFF )
+  if [ -n "$ARM_ARCH" ]; then
+    CMAKE_ARCH_FLAGS+=( -DGGML_CPU_ARM_ARCH="$ARM_ARCH" )
+    ok "Targeting ARM arch: $ARM_ARCH"
+  else
+    warn "Native disabled without --arm-arch — the binary may miss NEON/dotprod speedups."
+  fi
+fi
+
+log "Configuring (CMake, CPU backend$([ "$USE_NATIVE" -eq 1 ] && echo ', native kernels'))"
 cmake -S "$LLAMA_DIR" -B "$BUILD_DIR" \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
   -DGGML_CUDA=OFF \
   -DGGML_METAL=OFF \
-  -DGGML_NATIVE=ON \
+  "${CMAKE_ARCH_FLAGS[@]}" \
   $CMAKE_CURL_FLAG \
   -DLLAMA_BUILD_SERVER=ON
 
 log "Compiling with -j$JOBS (this can take 15-40 minutes on a Pi — be patient)"
 if ! cmake --build "$BUILD_DIR" --config "$BUILD_TYPE" -j "$JOBS"; then
-  warn "Build failed. If it was Killed/OOM, retry single-threaded:  ./build_pi.sh --jobs 1"
+  warn "Build failed."
+  warn "  • If it was Killed/OOM: add swap (see above) and retry:  ./build_pi.sh --jobs 1"
+  warn "  • If the compiler rejected -mcpu=native: retry with an explicit target, e.g."
+  warn "        Raspberry Pi 5:  ./build_pi.sh --arm-arch armv8.2-a+dotprod+fp16"
+  warn "        Raspberry Pi 4:  ./build_pi.sh --arm-arch armv8-a+crc+simd"
   die "Compilation failed."
 fi
 
